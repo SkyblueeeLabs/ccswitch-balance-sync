@@ -1,0 +1,16 @@
+# 敏感文件 —— 绝对不要提交
+state.json
+cc-switch.backup-*.db
+*.db
+*.log
+
+# 注意：config.json 里没有任何密钥（只有接口地址和字段路径），
+# 所以它是要提交的，别人 clone 下来才能直接运行。
+
+# 依赖
+node_modules/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store

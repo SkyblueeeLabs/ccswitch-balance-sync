@@ -1,0 +1,30 @@
+{
+  "providers": [
+    {
+      "name": "MiMo",
+      "matchName": "MiMo",
+      "loginUrl": "https://platform.xiaomimimo.com/#/console/balance",
+      "homeUrl": "https://platform.xiaomimimo.com/",
+      "apiUrl": "https://platform.xiaomimimo.com/api/v1/balance",
+      "method": "GET",
+      "cookieDomain": "xiaomimimo.com",
+      "cookieNames": ["api-platform_serviceToken", "userId"],
+      "balancePath": "data.balance",
+      "currencyPath": "data.currency",
+      "successCheck": "code"
+    },
+    {
+      "name": "LongCat",
+      "matchName": "LongCat",
+      "loginUrl": "https://longcat.chat/platform/usage?tab=api",
+      "homeUrl": "https://longcat.chat/platform/usage?tab=api",
+      "apiUrl": "https://longcat.chat/api/pay/quota/metering/api-usage/summary",
+      "method": "POST",
+      "cookieDomain": "longcat.chat",
+      "cookieNames": ["passport_token_key", "long_cat_region_key"],
+      "balancePath": "data.paygoBalance.primary.amount",
+      "currencyPath": "data.paygoBalance.primary.currency",
+      "successCheck": "code"
+    }
+  ]
+}

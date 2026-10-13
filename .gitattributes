@@ -1,0 +1,16 @@
+# 统一换行符，避免跨平台 clone 后脚本无法运行
+# .bat 是 Windows 批处理，必须保持 CRLF，否则可能执行异常
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# JS / JSON / Markdown 用 LF 即可
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# 二进制
+*.db binary
+*.png binary
+*.jpg binary
