@@ -22,24 +22,41 @@
 | 供应商 | 余额接口 | 认证方式 |
 |--------|----------|----------|
 | MiMo（小米） | `GET /api/v1/balance` | Cookie |
-| LongCat（美团） | `POST /api/pay/quota/metering/api-usage/summary` | Cookie |
+| LongCat（美团） | `POST /api/pay/quota/metering/api-usage/summary` + `POST /api/pay/quota/metering/token-packs/summary` | Cookie |
 
 ## 工作原理
 
 ```
 登录一次所有供应商 → 保存浏览器状态（state.json）
                             ↓
-        每次同步时自动加载状态 → 查询所有供应商余额 → 写入 CC Switch
+       CC Switch 直接实时请求余额接口 → extractor 提取现金余额
                             ↓
-              Cookie 过期时 → 自动弹出浏览器重新登录
+      隐藏的短时计划任务用已保存的 Cookie 更新 Token Plan 快照
+                            ↓
+        Cookie 过期时 → 任务记日志；运行 2-login 登录并自动同步
 ```
+
+### 架构说明
+
+```
+CC Switch 用量查询
+    └──→ HTTPS 余额接口（每次查询取最新现金余额）
+
+Windows 计划任务（每 10 分钟短暂运行后退出）
+    ├──→ 校验 Cookie 并刷新 Token Plan 快照
+    └──→ 更新 CC Switch 数据库（无需重启应用）
+```
+
+> CC Switch 的自定义脚本每次只发一个 HTTP 请求。现金余额由 CC Switch 直接查询；LongCat 的 Token Plan 来自另一个接口，由短时计划任务更新快照。项目不再启动常驻本地代理。
+> CC Switch 对当前使用中的供应商每 5 分钟自动查询一次；需要立即刷新时，可以点击卡片上的余额信息。Token Plan 快照由计划任务每 10 分钟更新。
 
 ### 核心特性
 
 - **多供应商支持**：一个项目管理多家供应商余额
-- **全自动维护**：Windows 任务计划程序每 6 小时自动刷新
-- **一键同步**：双击 `3-sync.bat` 立即同步所有供应商
-- **自动重启**：写入后自动重启 cc-switch，代码区和余额都正常显示
+- **实时余额**：CC Switch 每次用量查询直接请求供应商余额接口
+- **自动维护**：隐藏计划任务每 10 分钟检查已保存的 Cookie 并更新 Token Plan 快照
+- **无需常驻进程**：每轮同步完成后 Node.js 进程退出，不启动本地代理、不重启 CC Switch
+- **一键同步**：双击 `3-sync.bat` 立即校验并同步所有供应商
 
 ## 前置条件
 
@@ -48,7 +65,7 @@
 | ✅ CC Switch 已安装 | 版本 3.0 以上 |
 | ✅ 供应商已配置 | 在 CC Switch 里添加供应商，填入有效的 API Key |
 | ✅ API 可正常调用 | 能用模型正常对话/推理 |
-| ✅ Node.js 已安装 | 版本 18 以上 |
+| ✅ Node.js 已安装 | 版本 22.5 以上（使用内置 `node:sqlite`） |
 | ✅ Windows 10/11 | 用于任务计划程序 |
 
 ## 安装
@@ -59,9 +76,7 @@
 
 ### 第二步：登录所有供应商
 
-双击运行 `2-login.bat`
-
-会依次弹出浏览器窗口，登录每个供应商后回到命令行按 **Enter**。
+双击运行 `2-login.bat`。它会自动检查所有供应商的已保存登录状态；如果仍有效，会自动保存并同步余额，无需操作。如果某家需要重新登录，在浏览器中完成登录后回到命令行按 **Enter**，脚本会自动保存状态并同步余额。
 
 ### 第 2.5 步（首次必须）：设置自定义模板
 
@@ -75,23 +90,24 @@
 > ⚠️ **这一步只需要做一次**。如果不设置成"自定义"模板，脚本写入的代码会被 cc-switch 覆盖。
 > 官方模板、Token Plan 等内置模板都不支持自定义代码。
 
-### 第三步：同步余额
+### 第三步（可选）：手动重新同步
 
 双击运行 `3-sync.bat`
 
-自动查询所有供应商余额并写入 CC Switch，写入后自动重启 cc-switch。
+双击运行 `3-sync.bat` 可随时重新校验登录态并更新 CC Switch 用量脚本。通常 `2-login.bat` 保存状态后会自动执行同步。现金余额由 CC Switch 直接实时查询；套餐快照在同步时更新，无需重启 CC Switch。
 
 ### 第四步（可选）：设置自动刷新
 
 **右键 `4-setup-task.bat` → 以管理员身份运行**
 
-任务创建后每 6 小时自动刷新一次余额，输出写入 `auto-sync.log`。
+任务创建后每 10 分钟静默同步一次，输出写入 `auto-sync.log`。Node.js 只在同步期间运行，完成后自动退出。
 
 | 项目 | 值 |
 |------|-----|
 | 任务名 | `CCSwitchBalanceSync` |
-| 频率 | 每 6 小时 |
+| 频率 | 每 10 分钟 |
 | 运行账户 | 当前登录用户（交互式，无需密码） |
+| 窗口 | 隐藏运行，无控制台窗口 |
 | 日志 | `auto-sync.log` |
 
 创建后可以立即手动触发一次验证：
@@ -100,9 +116,10 @@
 schtasks /Run /TN "CCSwitchBalanceSync"
 ```
 
-> 💡 自动刷新使用 Node 内置 `fetch` 直接请求余额接口，**不启动浏览器**，因此不会弹窗。
-> 只有在 Cookie 过期需要重新登录时才会打开浏览器 —— 而计划任务无人值守，
-> 此时脚本会记录提示并退出，需要你手动双击 `2-login.bat` 重新登录。
+> 💡 计划任务通过隐藏 PowerShell 运行器启动 Node.js，**不打开控制台或浏览器**，同步结束即退出。
+> 只有 Cookie 过期时才需要你手动双击 `2-login.bat`；如果已保存的登录态仍有效，它会自动获取并同步；否则完成登录后会自动同步。无人值守任务只会记录提示并退出。
+
+> 从旧版升级时，请重新运行一次 `4-setup-task.bat`（管理员身份）以替换旧的 6 小时任务。首次手动同步或重建任务时会清理旧版代理进程。
 
 > ⚠️ **从旧版单独项目升级上来的话**：旧版各自创建过独立任务
 > （`MiMoCookieAutoRefresh` / `LongCatCookieAutoRefresh`），它们仍然每 6 小时运行、
@@ -126,11 +143,11 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 
 ## 使用
 
-| 操作 | 方式 |
-|------|------|
-| 手动同步所有供应商 | 双击 `3-sync.bat` |
-| 重新登录 | 双击 `2-login.bat` |
-| 自动刷新 | 任务计划程序每 6 小时自动运行 |
+| 操作 | 方式 | 说明 |
+|------|------|------|
+| 手动同步 | 双击 `3-sync.bat` | 立即校验接口并更新脚本 |
+| 重新登录 | 双击 `2-login.bat` | Cookie 过期时使用 |
+| 自动刷新 | 计划任务每 10 分钟 | 隐藏运行，完成后退出 |
 
 ## 添加新供应商
 
@@ -148,9 +165,12 @@ schtasks /Run /TN "CCSwitchBalanceSync"
   "cookieNames": ["关键 Cookie 名称"],
   "balancePath": "余额字段路径，如 data.balance",
   "currencyPath": "币种字段路径，如 data.currency",
-  "successCheck": "code"
+  "successCheck": "code",
+  "tokenPacksApiUrl": "套餐余额接口 URL（可选，有则同时显示 Token Plan）"
 }
 ```
+
+> **`tokenPacksApiUrl`**：如果供应商有额外的套餐/额度接口，填上后同步任务会读取并保存 Token Plan 快照。现金余额仍由 CC Switch 直接实时查询；套餐快照最迟约 10 分钟刷新一次。
 
 > ⚠️ **路径要写全**：`balancePath` 必须包含 `data.` 前缀（如 `data.paygoBalance.primary.amount`）。
 > CC Switch 传给 extractor 的是接口原始响应体，`data` 不会被自动解包。
@@ -168,13 +188,15 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 |------|------|
 | `config.json` | 供应商配置（接口、字段映射） |
 | `1-install.bat` | 安装 Playwright 和 Chromium |
-| `2-login.bat` | 登录所有供应商 |
-| `3-sync.bat` | 手动同步所有供应商余额 |
+| `2-login.bat` | 复用有效登录态或重新登录，并自动同步余额 |
+| `3-sync.bat` | 手动同步所有供应商状态和套餐快照 |
 | `4-setup-task.bat` | 创建自动刷新任务（需管理员权限） |
 | `setup-task.ps1` | 任务创建脚本 |
+| `run-auto-sync.ps1` | 隐藏运行计划任务并写日志 |
+| `stop-legacy-proxy.ps1` | 升级时清理旧版常驻代理 |
 | `playwright-login.mjs` | 登录脚本 |
 | `playwright-cookie.mjs` | 余额同步脚本 |
-| `playwright-auto.mjs` | 自动维护脚本 |
+| `playwright-auto.mjs` | 自动维护脚本（计划任务用） |
 | `auto-sync.log` | 计划任务运行日志（自动生成） |
 | `state.json` | 浏览器登录状态（每台机器不同，不打包） |
 | `cc-switch.backup-*.db` | CC Switch 数据库备份（自动生成） |
@@ -184,6 +206,8 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 - **Cookie 是账号级登录态**：获取 Cookie 后可以操作你的账号，风险高于普通 API Key
 - **不要分享 `state.json`**：该文件包含你的完整登录状态
 - **谨慎使用云同步**：如果 CC Switch 开启了 WebDAV 自动同步，Cookie 会被上传到云端
+- **同步不开放本地端口**：CC Switch 和计划任务直接通过 HTTPS 访问供应商接口
+- **Cookie 仍需保护**：用量脚本会把 Cookie 写入 CC Switch 本地数据库；请保护数据库和 `state.json`
 
 ### 上传到 GitHub 前
 
@@ -213,7 +237,7 @@ git ls-files | findstr state    # 应无输出
 ## 常见问题
 
 **Q: 同步失败怎么办？**
-A: 先运行 `2-login.bat` 重新登录，再运行 `3-sync.bat`。
+A: 运行 `2-login.bat`。它会检查现有登录态，需要时让你重新登录，并在保存后自动同步；也可以单独运行 `3-sync.bat` 重试。
 
 **Q: 余额不显示？**
 A: 确认供应商的用量查询已设置成"自定义"模板并保存。
@@ -222,7 +246,7 @@ A: 确认供应商的用量查询已设置成"自定义"模板并保存。
 A: 检查任务是否存在：`schtasks /Query /TN "CCSwitchBalanceSync"`，并查看 `auto-sync.log` 了解每轮结果。手动触发测试：`schtasks /Run /TN "CCSwitchBalanceSync"`。
 
 **Q: 自动刷新时会不会弹浏览器窗口？**
-A: 不会。常规刷新走纯 HTTP 请求。只有 Cookie 过期需要重新登录时才会用到浏览器，而计划任务是无人值守的，此时只记录日志，不会弹窗卡住。
+A: 不会。计划任务使用隐藏 PowerShell 运行器，常规同步不启动浏览器；任务进程完成后自动退出。Cookie 过期时只写日志，不会弹窗卡住。
 
 **Q: 余额显示的数字过一会儿又变回去了 / 修复的问题反复出现？**
 A: 大概率是有**旧的独立任务还在运行**，往同一个数据库写旧脚本。检查并删除旧任务：
@@ -243,6 +267,15 @@ A: Windows 任务计划程序需要管理员权限才能创建任务。创建一
 
 **Q: 提示「执行 extractor 失败: Exception generated by QuickJS」？**
 A: 说明写入 CC Switch 的脚本取值路径错了。关键点：**extractor 收到的 `response` 是接口原始响应体，`data` 不会被解包**，因此路径要写完整的 `data.balance`，不能简写成 `balance`。这类错误在 QuickJS 里表现为变量未定义的异常。重新运行一次 `3-sync.bat` 会覆盖修正。
+
+**Q: 余额只显示一个数字，没有 Token Plan？**
+A: 检查 `config.json` 里该供应商是否配置了 `tokenPacksApiUrl`。如果没有这个字段，只会显示现金余额。
+
+**Q: 还需要本地代理吗？**
+A: 不需要。CC Switch 直接请求现金余额接口；LongCat Token Plan 由计划任务更新快照。
+
+**Q: CC Switch 首页显示不全？**
+A: CC Switch 首页的显示格式是固定的 `remaining unit`，空间有限。当前格式为 `10 ¥ · 6484.7万`（余额 · Token Plan），已经是能显示完整信息的最短格式。
 
 ## 免责声明
 

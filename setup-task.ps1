@@ -4,8 +4,11 @@ $ErrorActionPreference = 'Stop'
 
 $taskName   = "CCSwitchBalanceSync"
 $scriptPath = Join-Path $PSScriptRoot "playwright-auto.mjs"
+$runnerPath = Join-Path $PSScriptRoot "run-auto-sync.ps1"
+$cleanupPath = Join-Path $PSScriptRoot "stop-legacy-proxy.ps1"
 $logPath    = Join-Path $PSScriptRoot "auto-sync.log"
 $currentUser = "$env:USERDOMAIN\$env:USERNAME"
+$refreshMinutes = 10
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -16,11 +19,16 @@ Write-Host "  Task name:  $taskName"
 Write-Host "  Script:     $scriptPath"
 Write-Host "  Log:        $logPath"
 Write-Host "  User:       $currentUser"
-Write-Host "  Frequency:  Every 6 hours"
+Write-Host "  Frequency:  Every $refreshMinutes minutes"
 Write-Host ""
 
 if (-not (Test-Path $scriptPath)) {
   Write-Host "[ERROR] 找不到脚本: $scriptPath" -ForegroundColor Red
+  Read-Host "按 Enter 退出"
+  exit 1
+}
+if (-not (Test-Path $runnerPath)) {
+  Write-Host "[ERROR] 找不到隐藏运行器: $runnerPath" -ForegroundColor Red
   Read-Host "按 Enter 退出"
   exit 1
 }
@@ -55,31 +63,36 @@ if (-not $nodeCmd) {
 Write-Host "  Node:       $nodeCmd" -ForegroundColor Gray
 Write-Host ""
 
-# 用 XML 注册，便于控制电池/补跑等设置
-# 注意：DisallowStartIfOnBatteries=false + StartWhenAvailable=true
-# 否则笔记本在电池供电时会静默跳过任务
-#
-# Arguments 里的 & 必须转义成 &amp;，否则 XML 非法、schtasks 会拒绝
+# 隐藏运行器短暂启动 Node，同步完成后进程退出，不常驻。
+$powerShellCmd = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$escapedPowerShell = [System.Security.SecurityElement]::Escape($powerShellCmd)
 $escapedNode   = [System.Security.SecurityElement]::Escape($nodeCmd)
 $escapedScript = [System.Security.SecurityElement]::Escape($scriptPath)
+$escapedRunner = [System.Security.SecurityElement]::Escape($runnerPath)
 $escapedLog    = [System.Security.SecurityElement]::Escape($logPath)
 $escapedPwd    = [System.Security.SecurityElement]::Escape($PSScriptRoot)
 $escapedUser   = [System.Security.SecurityElement]::Escape($currentUser)
-$arguments     = "/c `"`"$escapedNode`" `"$escapedScript`" >> `"$escapedLog`" 2>&amp;1`""
+$arguments     = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$escapedRunner`" -NodePath `"$escapedNode`" -ScriptPath `"$escapedScript`" -LogPath `"$escapedLog`""
+$startBoundary = (Get-Date).ToString("s")
+
+# 清理由旧版同步脚本留下的本项目代理进程。
+if (Test-Path $cleanupPath) {
+  & $powerShellCmd -NoProfile -ExecutionPolicy Bypass -File $cleanupPath
+}
 
 $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>CC Switch 余额自动同步（每 6 小时）</Description>
+    <Description>CC Switch 余额静默同步（每 $refreshMinutes 分钟）</Description>
   </RegistrationInfo>
   <Triggers>
     <TimeTrigger>
       <Repetition>
-        <Interval>PT6H</Interval>
+        <Interval>PT${refreshMinutes}M</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
-      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <StartBoundary>$startBoundary</StartBoundary>
       <Enabled>true</Enabled>
     </TimeTrigger>
   </Triggers>
@@ -100,7 +113,7 @@ $xml = @"
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>cmd.exe</Command>
+      <Command>$escapedPowerShell</Command>
       <Arguments>$arguments</Arguments>
       <WorkingDirectory>$escapedPwd</WorkingDirectory>
     </Exec>

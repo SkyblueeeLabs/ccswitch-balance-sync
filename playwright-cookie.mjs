@@ -1,9 +1,9 @@
 // playwright-cookie.mjs — 加载登录状态，查询所有供应商余额，写入 cc-switch
 import { createRequire } from 'module';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { readFileSync, copyFileSync, existsSync } from 'node:fs';
+import { readFileSync, copyFileSync, existsSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -11,6 +11,20 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = join(__dirname, 'state.json');
 const DB = process.env.USERPROFILE + '\\.cc-switch\\cc-switch.db';
 const config = JSON.parse(readFileSync(join(__dirname, 'config.json'), 'utf8'));
+// 清理旧版本遗留的常驻代理；只匹配本项目代理脚本的完整路径。
+function stopLegacyProxy() {
+  const cleanupScript = join(__dirname, 'stop-legacy-proxy.ps1');
+  if (!existsSync(cleanupScript)) return;
+  try {
+    execFileSync('powershell.exe', [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', cleanupScript,
+    ], { stdio: 'ignore', windowsHide: true });
+  } catch {
+    console.log('⚠ 无法自动清理旧版代理；如果它仍在运行，请手动关闭旧的 balance-proxy.mjs 进程。');
+  }
+}
+
+stopLegacyProxy();
 
 async function loadPlaywright() {
   // 1. 本地 node_modules
@@ -48,63 +62,47 @@ async function loadPlaywright() {
 
 const { chromium } = await loadPlaywright();
 
-// 重启 cc-switch
-function restartCCSwitch() {
-  try {
-    execSync('taskkill /f /im cc-switch.exe', { stdio: 'ignore' });
-    setTimeout(() => {
-      const exePath = process.env.LOCALAPPDATA + '\\Programs\\CC Switch\\cc-switch.exe';
-      execSync(`start "" "${exePath}"`, { stdio: 'ignore' });
-    }, 2000);
-    console.log('✓ cc-switch 已重启');
-  } catch {
-    console.log('⚠ 重启失败，请手动重启 cc-switch');
-  }
-}
-
 // 按路径从对象中取值（如 "data.paygoBalance.primary.amount"）
 function getByPath(obj, path) {
   if (!path) return undefined;
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
 }
 
-// 构造余额查询脚本（extractor 内自带取值工具，避免生成超长表达式）
-function buildScript(p, cookieHeader) {
-  // extractor 收到的是接口原始响应体，data 不会被解包，
-  // 所以这里必须保留完整路径：data.balance / data.paygoBalance.primary.amount
+// CC Switch 直接查询现金余额；Token Plan 使用最近一次同步到数据库的快照。
+function buildScript(p, cookieHeader, tokenPlan) {
   return `({
   request: {
-    url: "${p.apiUrl}",
-    method: "${p.method}",
+    url: ${JSON.stringify(p.apiUrl)},
+    method: ${JSON.stringify(p.method)},
     headers: {
       "Content-Type": "application/json",
       "X-Client-Language": "zh",
       "X-Requested-With": "XMLHttpRequest",
       "Cookie": ${JSON.stringify(cookieHeader)}
-    }${p.method === 'POST' ? ',\n    data: "{}"' : ''}
+    }${p.method === 'POST' ? `,\n    body: "{}"` : ''}
   },
   extractor: function (response) {
-    if (response == null) return { isValid: false, invalidMessage: "响应为空" };
-    if (response.code !== 0) {
-      return { isValid: false, invalidMessage: response.msg || "查询失败" };
-    }
-    // 按 "a.b.c" 逐级安全取值，任一级缺失都返回 undefined 而不抛异常
+    if (response == null || response.code !== 0) return { isValid: false, invalidMessage: (response && response.msg) || "查询失败" };
     function pick(path) {
-      var cur = response;
-      var keys = String(path).split(".");
+      var value = response;
+      var keys = path.split(".");
       for (var i = 0; i < keys.length; i++) {
-        if (cur == null) return undefined;
-        cur = cur[keys[i]];
+        if (value == null) return undefined;
+        value = value[keys[i]];
       }
-      return cur;
+      return value;
     }
-    var data = response.data || {};
+    var rawBalance = pick(${JSON.stringify(p.balancePath)});
+    if (rawBalance == null || !isFinite(Number(rawBalance))) return { isValid: false, invalidMessage: "未找到余额字段" };
+    var balance = Number(rawBalance);
+    var currency = pick(${JSON.stringify(p.currencyPath)}) || "CNY";
+    var tokenPlan = ${tokenPlan == null ? 'null' : JSON.stringify(tokenPlan)};
     return {
       isValid: true,
-      planName: "${p.name} 余额",
-      remaining: Number(pick(${JSON.stringify(p.balancePath)})) || 0,
-      unit: pick(${JSON.stringify(p.currencyPath)}) || "CNY",
-      extra: String(data.paygoStatus || data.status || "")
+      planName: ${JSON.stringify(p.name)},
+      remaining: balance,
+      unit: tokenPlan == null ? currency : "¥ · " + (tokenPlan / 10000).toFixed(1) + "万",
+      extra: ""
     };
   }
 })`;
@@ -129,8 +127,33 @@ async function queryProvider(page, p) {
   if (result.code !== 0) return { error: result.msg || `code=${result.code}` };
   const balance = getByPath(result, p.balancePath);
   const currency = getByPath(result, p.currencyPath) || 'CNY';
-  if (!balance) return { error: '未找到余额字段' };
-  return { balance, currency, status: result.data?.paygoStatus || result.data?.status || '' };
+  if (balance == null) return { error: '未找到余额字段' };
+
+  // 查 token plan
+  let tokenPlan = null;
+  let tokenPlanError = null;
+  if (p.tokenPacksApiUrl) {
+    try {
+      const r2 = await page.evaluate(async (apiUrl) => {
+        const resp = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Client-Language': 'zh', 'X-Requested-With': 'XMLHttpRequest' },
+          body: '{}',
+        });
+        return resp.json();
+      }, p.tokenPacksApiUrl);
+      if (r2.code === 0) {
+        const lots = [r2.data?.currentLot].concat(r2.data?.otherLots || []).filter(Boolean);
+        tokenPlan = lots.reduce((sum, lot) => sum + (Number(lot.remainingToken) || 0), 0);
+      } else {
+        tokenPlanError = r2.msg || `code=${r2.code}`;
+      }
+    } catch (e) {
+      tokenPlanError = e.message;
+    }
+  }
+
+  return { balance, currency, tokenPlan, tokenPlanError };
 }
 
 // 获取 Cookie
@@ -142,8 +165,25 @@ async function getCookieHeader(context, p) {
     .join('; ');
 }
 
+let backupCreated = false;
+
+function backupDatabaseOnce() {
+  if (backupCreated) return;
+  const backupDir = dirname(DB);
+  const backupPath = DB.replace(/\.db$/, '') + `.backup-${Date.now()}.db`;
+  copyFileSync(DB, backupPath);
+  backupCreated = true;
+  const backups = readdirSync(backupDir)
+    .filter(name => name.startsWith('cc-switch.backup-') && name.endsWith('.db'))
+    .map(name => ({ path: join(backupDir, name), modified: statSync(join(backupDir, name)).mtimeMs }))
+    .sort((a, b) => b.modified - a.modified);
+  for (const old of backups.slice(20)) {
+    try { unlinkSync(old.path); } catch {}
+  }
+}
+
 // 写入 cc-switch 数据库
-function writeToCCSwitch(p, cookieHeader, balance, currency, status) {
+function writeToCCSwitch(p, cookieHeader, tokenPlan) {
   const db = new DatabaseSync(DB);
   const rows = db.prepare(
     "SELECT id, meta FROM providers WHERE name LIKE ? AND app_type='claude'"
@@ -162,12 +202,32 @@ function writeToCCSwitch(p, cookieHeader, balance, currency, status) {
       timeout: 10, templateType: 'custom', autoQueryInterval: 5,
     };
   }
+  let effectiveTokenPlan = tokenPlan;
+  if (effectiveTokenPlan == null && p.tokenPacksApiUrl) {
+    const currentCode = meta.usage_script.code;
+    const cached = typeof currentCode === 'string'
+      ? currentCode.match(/var tokenPlan = (null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?);/)
+      : null;
+    if (cached && cached[1] !== 'null' && Number.isFinite(Number(cached[1]))) {
+      effectiveTokenPlan = Number(cached[1]);
+    }
+  }
+  const newCode = buildScript(p, cookieHeader, effectiveTokenPlan);
+  const changed = JSON.parse(row.meta).commonConfigEnabled !== false ||
+    meta.usage_script.templateType !== 'custom' ||
+    meta.usage_script.enabled !== true ||
+    meta.usage_script.autoQueryInterval !== 5 ||
+    meta.usage_script.code !== newCode;
+  if (!changed) {
+    db.close();
+    return { ok: true, changed: false };
+  }
   meta.usage_script.templateType = 'custom';
   meta.usage_script.enabled = true;
-  meta.usage_script.code = buildScript(p, cookieHeader);
+  meta.usage_script.autoQueryInterval = 5;
+  meta.usage_script.code = newCode;
 
-  const bak = DB.replace(/\.db$/, '') + `.backup-${Date.now()}.db`;
-  copyFileSync(DB, bak);
+  backupDatabaseOnce();
   db.exec('BEGIN IMMEDIATE');
   try {
     db.prepare('UPDATE providers SET meta=? WHERE id=?').run(JSON.stringify(meta), row.id);
@@ -179,7 +239,7 @@ function writeToCCSwitch(p, cookieHeader, balance, currency, status) {
     return { ok: false, reason: e.message };
   }
   db.close();
-  return { ok: true };
+  return { ok: true, changed: true };
 }
 
 // ==================== 主流程 ====================
@@ -200,9 +260,10 @@ for (const p of config.providers) {
       continue;
     }
     const cookieHeader = await getCookieHeader(context, p);
-    const w = writeToCCSwitch(p, cookieHeader, result.balance, result.currency, result.status);
+    const w = writeToCCSwitch(p, cookieHeader, result.tokenPlan);
     if (w.ok) {
-      console.log(`  ✓ 余额: ${result.balance} ${result.currency}`);
+      const planNote = result.tokenPlanError ? '；Token Plan 查询失败，沿用上次快照' : '';
+      console.log(`  ✓ 余额: ${result.balance} ${result.currency}${planNote}`);
     } else {
       console.log(`  ✗ ${w.reason}`);
       allOk = false;
@@ -216,8 +277,7 @@ for (const p of config.providers) {
 await browser.close();
 
 if (allOk) {
-  console.log('\n全部同步成功，正在重启 cc-switch...');
-  restartCCSwitch();
+  console.log('\n全部同步成功；CC Switch 下次查询时会直接请求供应商余额接口。');
 } else {
   console.log('\n部分同步失败，请检查上方错误信息。');
 }

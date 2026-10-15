@@ -3,8 +3,8 @@
     {
       "name": "MiMo",
       "matchName": "MiMo",
-      "loginUrl": "https://platform.xiaomimimo.com/#/console/balance",
-      "homeUrl": "https://platform.xiaomimimo.com/",
+      "loginUrl": "https://platform.xiaomimimo.com/console/balance",
+      "homeUrl": "https://platform.xiaomimimo.com/console/balance",
       "apiUrl": "https://platform.xiaomimimo.com/api/v1/balance",
       "method": "GET",
       "cookieDomain": "xiaomimimo.com",
@@ -24,7 +24,8 @@
       "cookieNames": ["passport_token_key", "long_cat_region_key"],
       "balancePath": "data.paygoBalance.primary.amount",
       "currencyPath": "data.paygoBalance.primary.currency",
-      "successCheck": "code"
+      "successCheck": "code",
+      "tokenPacksApiUrl": "https://longcat.chat/api/pay/quota/metering/token-packs/summary"
     }
   ]
 }
