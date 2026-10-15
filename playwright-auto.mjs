@@ -9,8 +9,16 @@ import { DatabaseSync } from 'node:sqlite';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = join(__dirname, 'state.json');
+const DISPLAY_MODE_FILE = join(__dirname, 'display-mode.json');
 const DB = process.env.USERPROFILE + '\\.cc-switch\\cc-switch.db';
 const config = JSON.parse(readFileSync(join(__dirname, 'config.json'), 'utf8'));
+let displayMode = config.usageDisplayMode === 'full' || config.longCatDisplayMode === 'full' ? 'full' : 'compact';
+if (existsSync(DISPLAY_MODE_FILE)) {
+  try {
+    const savedMode = JSON.parse(readFileSync(DISPLAY_MODE_FILE, 'utf8')).mode;
+    if (savedMode === 'compact' || savedMode === 'full') displayMode = savedMode;
+  } catch {}
+}
 async function loadPlaywright() {
   // 1. 本地 node_modules
   try {
@@ -50,8 +58,76 @@ function getByPath(obj, path) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
 }
 
+function parseMiMoTokenPlan(response, itemNames) {
+  if (response?.code !== 0) {
+    return { error: response?.msg || response?.message || `code=${response?.code}` };
+  }
+  const usage = response.data?.usage;
+  if (usage == null || (Array.isArray(usage.items) && usage.items.length === 0)) {
+    return { tokenPlan: null };
+  }
+  if (!Array.isArray(usage.items)) return { error: 'MiMo Token Plan 响应缺少 usage.items' };
+
+  const names = itemNames || ['plan_total_token', 'compensation_total_token'];
+  const items = usage.items.filter(item => names.includes(item?.name));
+  if (items.length === 0) return { error: 'MiMo Token Plan 未返回已知额度字段' };
+
+  let remaining = 0;
+  let total = 0;
+  let usedTotal = 0;
+  for (const item of items) {
+    const used = Number(item.used);
+    const limit = Number(item.limit);
+    if (!Number.isFinite(used) || !Number.isFinite(limit)) {
+      return { error: `MiMo Token Plan 字段无效: ${item.name}` };
+    }
+    remaining += Math.max(0, limit - used);
+    total += limit;
+    usedTotal += used;
+  }
+  return { tokenPlan: remaining, tokenPlanInfo: { total, used: usedTotal } };
+}
+
+function parseLongCatTokenPacks(response) {
+  if (response?.code !== 0) {
+    return { error: response?.msg || response?.message || `code=${response?.code}` };
+  }
+  const lots = [response.data?.currentLot].concat(response.data?.otherLots || []).filter(Boolean);
+  if (lots.length === 0) return { tokenPlan: null, tokenPlanInfo: null };
+
+  const sumField = field => {
+    const values = lots.map(lot => Number(lot[field])).filter(Number.isFinite);
+    return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
+  };
+  const expiryNotes = lots
+    .map((lot, index) => lot.expireTime
+      ? `${lots.length > 1 ? `包${index + 1} ` : ''}到期 ${lot.expireTime}`
+      : '')
+    .filter(Boolean);
+
+  return {
+    tokenPlan: lots.reduce((sum, lot) => sum + (Number(lot.remainingToken) || 0), 0),
+    tokenPlanInfo: {
+      total: sumField('totalToken'),
+      used: sumField('consumedToken'),
+      extra: expiryNotes.join('；'),
+    },
+  };
+}
+
+function formatTokenPlanNote(p, result) {
+  if (!p.tokenPacksApiUrl && !p.tokenPlanApiUrl) return '';
+  if (result.tokenPlanError) return '；TP 查询失败，沿用上次快照';
+  if (result.tokenPlan == null) return '；Token Plan';
+  return `；Token Plan 剩余 ¥ ${(result.tokenPlan / 10000).toFixed(1)}万`;
+}
+
+function formatCurrency(currency) {
+  return currency === 'CNY' ? '¥' : currency;
+}
+
 // CC Switch 直接查询现金余额；Token Plan 使用最近一次后台同步的快照。
-function buildScript(p, cookieHeader, tokenPlan) {
+function buildScript(p, cookieHeader, tokenPlan, tokenPlanEmpty = false, tokenPlanInfo = null) {
   return `({
   request: {
     url: ${JSON.stringify(p.apiUrl)},
@@ -78,12 +154,54 @@ function buildScript(p, cookieHeader, tokenPlan) {
     if (rawBalance == null || !isFinite(Number(rawBalance))) return { isValid: false, invalidMessage: "未找到余额字段" };
     var balance = Number(rawBalance);
     var currency = pick(${JSON.stringify(p.currencyPath)}) || "CNY";
+    var displayCurrency = currency === "CNY" ? "¥" : currency;
     var tokenPlan = ${tokenPlan == null ? 'null' : JSON.stringify(tokenPlan)};
+    var tokenPlanInfo = ${JSON.stringify(tokenPlanInfo || {})};
+    var unit = displayCurrency;
+    if (${(p.tokenPacksApiUrl || p.tokenPlanApiUrl) && displayMode === 'full' ? 'true' : 'false'} && tokenPlan == null && ${tokenPlanEmpty ? 'true' : 'false'}) {
+      return [
+        { isValid: true, planName: "现金余额", remaining: balance, unit: displayCurrency },
+        { isValid: true, planName: "Token Plan", remaining: 0, unit: "tokens" }
+      ];
+    }
+    if (tokenPlan != null) {
+      unit = "¥ · " + (tokenPlan / 10000).toFixed(1) + "万";
+    } else if (${tokenPlanEmpty ? 'true' : 'false'}) {
+      unit = displayCurrency + " · TP:无额度";
+    }
+    if (${p.tokenPacksApiUrl || p.tokenPlanApiUrl ? 'true' : 'false'} && tokenPlan != null) {
+      var tokenPlanUsage = {
+        isValid: true,
+        planName: ${JSON.stringify(p.tokenPlanApiUrl ? 'MiMo Token Plan' : 'Token Plan')},
+        remaining: tokenPlan,
+        unit: "tokens"
+      };
+      if (tokenPlanInfo.total != null && isFinite(Number(tokenPlanInfo.total))) tokenPlanUsage.total = Number(tokenPlanInfo.total);
+      if (tokenPlanInfo.used != null && isFinite(Number(tokenPlanInfo.used))) tokenPlanUsage.used = Number(tokenPlanInfo.used);
+      if (tokenPlanInfo.extra) tokenPlanUsage.extra = tokenPlanInfo.extra;
+      if (${(p.tokenPacksApiUrl || p.tokenPlanApiUrl) && displayMode === 'full' ? 'true' : 'false'}) {
+        return [
+          { isValid: true, planName: "现金余额", remaining: balance, unit: displayCurrency },
+          tokenPlanUsage
+        ];
+      }
+      var tokenPlanDetails = [];
+      if (tokenPlanInfo.total != null && isFinite(Number(tokenPlanInfo.total))) tokenPlanDetails.push("TP 总量 " + tokenPlanInfo.total + " tokens");
+      if (tokenPlanInfo.used != null && isFinite(Number(tokenPlanInfo.used))) tokenPlanDetails.push("TP 已用 " + tokenPlanInfo.used + " tokens");
+      if (tokenPlanInfo.extra) tokenPlanDetails.push(tokenPlanInfo.extra);
+      return {
+        isValid: true,
+        planName: ${JSON.stringify(p.name)},
+        remaining: balance,
+        unit: "¥ · " + (tokenPlan / 10000).toFixed(1) + "万",
+        extra: tokenPlanDetails.join(" · ")
+      };
+    }
     return {
       isValid: true,
       planName: ${JSON.stringify(p.name)},
       remaining: balance,
-      unit: tokenPlan == null ? currency : "¥ · " + (tokenPlan / 10000).toFixed(1) + "万",
+      unit: unit,
       extra: ""
     };
   }
@@ -113,6 +231,7 @@ async function queryProvider(page, p) {
   // 查 token plan
   let tokenPlan = null;
   let tokenPlanError = null;
+  let tokenPlanInfo = null;
   if (p.tokenPacksApiUrl) {
     try {
       const r2 = await page.evaluate(async (apiUrl) => {
@@ -123,18 +242,38 @@ async function queryProvider(page, p) {
         });
         return resp.json();
       }, p.tokenPacksApiUrl);
-      if (r2.code === 0) {
-        const lots = [r2.data?.currentLot].concat(r2.data?.otherLots || []).filter(Boolean);
-        tokenPlan = lots.reduce((sum, lot) => sum + (Number(lot.remainingToken) || 0), 0);
+      const parsed = parseLongCatTokenPacks(r2);
+      tokenPlan = parsed.tokenPlan ?? null;
+      tokenPlanInfo = parsed.tokenPlanInfo || null;
+      tokenPlanError = parsed.error || null;
+    } catch (e) {
+      tokenPlanError = e.message;
+    }
+  }
+
+  if (p.tokenPlanApiUrl) {
+    try {
+      const r3 = await page.evaluate(async ({ apiUrl, method }) => {
+        const resp = await fetch(apiUrl, {
+          method,
+          headers: { 'Content-Type': 'application/json', 'X-Client-Language': 'zh', 'X-Requested-With': 'XMLHttpRequest' },
+        });
+        return { status: resp.status, body: await resp.json() };
+      }, { apiUrl: p.tokenPlanApiUrl, method: p.tokenPlanMethod || 'GET' });
+      if (r3.status < 200 || r3.status >= 300) {
+        tokenPlanError = `HTTP ${r3.status}`;
       } else {
-        tokenPlanError = r2.msg || `code=${r2.code}`;
+        const parsed = parseMiMoTokenPlan(r3.body, p.tokenPlanItemNames);
+        tokenPlan = parsed.tokenPlan ?? null;
+        tokenPlanInfo = parsed.tokenPlanInfo || null;
+        tokenPlanError = parsed.error || null;
       }
     } catch (e) {
       tokenPlanError = e.message;
     }
   }
 
-  return { balance, currency, tokenPlan, tokenPlanError };
+  return { balance, currency, tokenPlan, tokenPlanError, tokenPlanInfo };
 }
 
 async function getCookieHeader(context, p) {
@@ -162,7 +301,7 @@ function backupDatabaseOnce() {
   }
 }
 
-function writeToCCSwitch(p, cookieHeader, tokenPlan) {
+function writeToCCSwitch(p, cookieHeader, tokenPlan, tokenPlanError = null, tokenPlanInfo = null) {
   const db = new DatabaseSync(DB);
   const rows = db.prepare(
     "SELECT id, meta FROM providers WHERE name LIKE ? AND app_type='claude'"
@@ -179,7 +318,7 @@ function writeToCCSwitch(p, cookieHeader, tokenPlan) {
     };
   }
   let effectiveTokenPlan = tokenPlan;
-  if (effectiveTokenPlan == null && p.tokenPacksApiUrl) {
+  if (effectiveTokenPlan == null && tokenPlanError && (p.tokenPacksApiUrl || p.tokenPlanApiUrl)) {
     const currentCode = meta.usage_script.code;
     const cached = typeof currentCode === 'string'
       ? currentCode.match(/var tokenPlan = (null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?);/)
@@ -188,7 +327,8 @@ function writeToCCSwitch(p, cookieHeader, tokenPlan) {
       effectiveTokenPlan = Number(cached[1]);
     }
   }
-  const newCode = buildScript(p, cookieHeader, effectiveTokenPlan);
+  const tokenPlanEmpty = Boolean((p.tokenPlanApiUrl || p.tokenPacksApiUrl) && !tokenPlanError && effectiveTokenPlan == null);
+  const newCode = buildScript(p, cookieHeader, effectiveTokenPlan, tokenPlanEmpty, tokenPlanInfo);
   const originalMeta = JSON.parse(row.meta);
   const changed = originalMeta.commonConfigEnabled !== false ||
     meta.usage_script.templateType !== 'custom' ||
@@ -255,6 +395,7 @@ async function queryProviderHttp(p, cookieHeader) {
   // 查 token plan（可选）
   let tokenPlan = null;
   let tokenPlanError = null;
+  let tokenPlanInfo = null;
   if (p.tokenPacksApiUrl) {
     try {
       const r2 = await fetch(p.tokenPacksApiUrl, {
@@ -264,18 +405,37 @@ async function queryProviderHttp(p, cookieHeader) {
         signal: AbortSignal.timeout(10000),
       });
       const j2 = await r2.json();
-      if (j2.code === 0) {
-        const lots = [j2.data?.currentLot].concat(j2.data?.otherLots || []).filter(Boolean);
-        tokenPlan = lots.reduce((sum, lot) => sum + (Number(lot.remainingToken) || 0), 0);
+      const parsed = parseLongCatTokenPacks(j2);
+      tokenPlan = parsed.tokenPlan ?? null;
+      tokenPlanInfo = parsed.tokenPlanInfo || null;
+      tokenPlanError = parsed.error || null;
+    } catch (e) {
+      tokenPlanError = e.message;
+    }
+  }
+
+  if (p.tokenPlanApiUrl) {
+    try {
+      const r3 = await fetch(p.tokenPlanApiUrl, {
+        method: p.tokenPlanMethod || 'GET',
+        headers,
+        signal: AbortSignal.timeout(10000),
+      });
+      const j3 = await r3.json();
+      if (!r3.ok) {
+        tokenPlanError = `HTTP ${r3.status}`;
       } else {
-        tokenPlanError = j2.msg || `code=${j2.code}`;
+        const parsed = parseMiMoTokenPlan(j3, p.tokenPlanItemNames);
+        tokenPlan = parsed.tokenPlan ?? null;
+        tokenPlanInfo = parsed.tokenPlanInfo || null;
+        tokenPlanError = parsed.error || null;
       }
     } catch (e) {
       tokenPlanError = e.message;
     }
   }
 
-  return { balance, currency, tokenPlan, tokenPlanError };
+  return { balance, currency, tokenPlan, tokenPlanError, tokenPlanInfo };
 }
 
 // 第 1 步: 用现有 state.json 直接查询（不启动浏览器）
@@ -306,11 +466,11 @@ if (existsSync(STATE_FILE)) {
           needRelogin = true;
           continue;
         }
-        const write = writeToCCSwitch(p, cookieHeader, result.tokenPlan);
+        const write = writeToCCSwitch(p, cookieHeader, result.tokenPlan, result.tokenPlanError, result.tokenPlanInfo);
         if (write.ok) {
           anyOk = true;
-          const planNote = result.tokenPlanError ? '；Token Plan 查询失败，沿用上次快照' : '';
-          console.log(`  ${p.name}: ✓ 余额 ${result.balance} ${result.currency}${planNote}`);
+          const planNote = formatTokenPlanNote(p, result);
+          console.log(`  ${p.name}: ✓ 余额 ${result.balance} ${formatCurrency(result.currency)}${planNote}`);
         } else {
           console.log(`  ${p.name}: 查到余额 ${result.balance}，但写入 CC Switch 失败`);
         }
@@ -401,14 +561,14 @@ for (const p of config.providers) {
       continue;
     }
     const cookieHeader = await getCookieHeader(context, p);
-    const write = writeToCCSwitch(p, cookieHeader, result.tokenPlan);
+    const write = writeToCCSwitch(p, cookieHeader, result.tokenPlan, result.tokenPlanError, result.tokenPlanInfo);
     if (!write.ok) {
       console.log(`  ${p.name}: ✗ 写入 CC Switch 失败`);
       allOk = false;
       continue;
     }
-    const planNote = result.tokenPlanError ? '；Token Plan 查询失败，沿用上次快照' : '';
-    console.log(`  ${p.name}: ✓ 余额 ${result.balance} ${result.currency}${planNote}`);
+    const planNote = formatTokenPlanNote(p, result);
+    console.log(`  ${p.name}: ✓ 余额 ${result.balance} ${formatCurrency(result.currency)}${planNote}`);
   } catch (e) {
     console.log(`  ${p.name}: ✗ ${e.message}`);
     allOk = false;

@@ -11,7 +11,10 @@
       "cookieNames": ["api-platform_serviceToken", "userId"],
       "balancePath": "data.balance",
       "currencyPath": "data.currency",
-      "successCheck": "code"
+      "successCheck": "code",
+      "tokenPlanApiUrl": "https://platform.xiaomimimo.com/api/v1/tokenPlan/usage",
+      "tokenPlanMethod": "GET",
+      "tokenPlanItemNames": ["plan_total_token", "compensation_total_token"]
     },
     {
       "name": "LongCat",

@@ -21,8 +21,18 @@
 
 | 供应商 | 余额接口 | 认证方式 |
 |--------|----------|----------|
-| MiMo（小米） | `GET /api/v1/balance` | Cookie |
+| MiMo（小米） | `GET /api/v1/balance` + `GET /api/v1/tokenPlan/usage` | Cookie |
 | LongCat（美团） | `POST /api/pay/quota/metering/api-usage/summary` + `POST /api/pay/quota/metering/token-packs/summary` | Cookie |
+
+## 显示效果
+
+### 简略模式
+
+![MiMo 与 LongCat 的简略模式显示效果](docs/images/compact-mode.png)
+
+### 完整模式
+
+![MiMo 与 LongCat 的完整模式显示效果](docs/images/full-mode.png)
 
 ## 工作原理
 
@@ -47,7 +57,7 @@ Windows 计划任务（每 10 分钟短暂运行后退出）
     └──→ 更新 CC Switch 数据库（无需重启应用）
 ```
 
-> CC Switch 的自定义脚本每次只发一个 HTTP 请求。现金余额由 CC Switch 直接查询；LongCat 的 Token Plan 来自另一个接口，由短时计划任务更新快照。项目不再启动常驻本地代理。
+> CC Switch 的自定义脚本每次只发一个 HTTP 请求。现金余额由 CC Switch 直接查询；MiMo 和 LongCat 的 Token Plan 来自各自的接口，由短时计划任务更新快照。MiMo 显示剩余 tokens 数量，LongCat 显示套餐额度。项目不再启动常驻本地代理。
 > CC Switch 对当前使用中的供应商每 5 分钟自动查询一次；需要立即刷新时，可以点击卡片上的余额信息。Token Plan 快照由计划任务每 10 分钟更新。
 
 ### 核心特性
@@ -57,6 +67,7 @@ Windows 计划任务（每 10 分钟短暂运行后退出）
 - **自动维护**：隐藏计划任务每 10 分钟检查已保存的 Cookie 并更新 Token Plan 快照
 - **无需常驻进程**：每轮同步完成后 Node.js 进程退出，不启动本地代理、不重启 CC Switch
 - **一键同步**：双击 `3-sync.bat` 立即校验并同步所有供应商
+- **用量显示可选**：双击 `5-select-display-mode.bat` 在简略和完整信息间切换 MiMo 与 LongCat
 
 ## 前置条件
 
@@ -146,6 +157,7 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 | 操作 | 方式 | 说明 |
 |------|------|------|
 | 手动同步 | 双击 `3-sync.bat` | 立即校验接口并更新脚本 |
+| 切换用量显示 | 双击 `5-select-display-mode.bat` | 选择简略或完整模式，并立即同步 MiMo 与 LongCat |
 | 重新登录 | 双击 `2-login.bat` | Cookie 过期时使用 |
 | 自动刷新 | 计划任务每 10 分钟 | 隐藏运行，完成后退出 |
 
@@ -166,11 +178,16 @@ schtasks /Run /TN "CCSwitchBalanceSync"
   "balancePath": "余额字段路径，如 data.balance",
   "currencyPath": "币种字段路径，如 data.currency",
   "successCheck": "code",
-  "tokenPacksApiUrl": "套餐余额接口 URL（可选，有则同时显示 Token Plan）"
+  "tokenPacksApiUrl": "LongCat 套餐接口 URL（可选）",
+  "tokenPlanApiUrl": "MiMo Token Plan 接口 URL（可选）",
+  "tokenPlanMethod": "Token Plan 接口方法，默认 GET",
+  "tokenPlanItemNames": ["要统计的额度项名称"]
 }
 ```
 
-> **`tokenPacksApiUrl`**：如果供应商有额外的套餐/额度接口，填上后同步任务会读取并保存 Token Plan 快照。现金余额仍由 CC Switch 直接实时查询；套餐快照最迟约 10 分钟刷新一次。
+> **Token Plan 配置**：LongCat 使用 `tokenPacksApiUrl` 解析 Token Pack 剩余/总量；MiMo 使用 `tokenPlanApiUrl`、`tokenPlanItemNames` 解析额度项的 `limit - used`。MiMo 以 `¥ · X万` 紧凑显示。套餐快照最迟约 10 分钟刷新一次。MiMo 目前使用的是控制台会话 Cookie 可访问的接口，该接口未作为稳定公开 API 发布，供应商变更后可能需要调整字段或请求方式。MiMo 官方将 Token Plan 定位为编程工具套餐；本项目只读取控制台额度信息，不使用 Token Plan 凭证调用模型接口，仍请遵守[官方使用说明](https://mimo.mi.com/docs/zh-CN/tokenplan)。
+
+> **显示模式**：双击 `5-select-display-mode.bat`，选 1 让 MiMo 与 LongCat 都使用简略摘要，选 2 分开展示现金余额和 Token Plan。简略模式下无套餐时显示 `TP:无额度`；完整模式保留 `Token Plan` 全称，无额度时显示 0 tokens。选择会保存在本地 `display-mode.json` 并立即同步；之后的 10 分钟计划任务沿用该选择。切换模式无需重新运行 `4-setup-task.bat`。
 
 > ⚠️ **路径要写全**：`balancePath` 必须包含 `data.` 前缀（如 `data.paygoBalance.primary.amount`）。
 > CC Switch 传给 extractor 的是接口原始响应体，`data` 不会被自动解包。
@@ -187,10 +204,13 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 | 文件 | 用途 |
 |------|------|
 | `config.json` | 供应商配置（接口、字段映射） |
+| `display-mode.json` | 当前用量显示模式（选择器自动生成，本地保存） |
 | `1-install.bat` | 安装 Playwright 和 Chromium |
 | `2-login.bat` | 复用有效登录态或重新登录，并自动同步余额 |
 | `3-sync.bat` | 手动同步所有供应商状态和套餐快照 |
 | `4-setup-task.bat` | 创建自动刷新任务（需管理员权限） |
+| `5-select-display-mode.bat` | 选择 MiMo 与 LongCat 的简略或完整显示模式 |
+| `set-display-mode.ps1` | 保存显示模式设置 |
 | `setup-task.ps1` | 任务创建脚本 |
 | `run-auto-sync-hidden.vbs` | 无控制台启动自动同步 |
 | `run-auto-sync.ps1` | 运行计划任务并写日志 |
@@ -270,13 +290,13 @@ A: Windows 任务计划程序需要管理员权限才能创建任务。创建一
 A: 说明写入 CC Switch 的脚本取值路径错了。关键点：**extractor 收到的 `response` 是接口原始响应体，`data` 不会被解包**，因此路径要写完整的 `data.balance`，不能简写成 `balance`。这类错误在 QuickJS 里表现为变量未定义的异常。重新运行一次 `3-sync.bat` 会覆盖修正。
 
 **Q: 余额只显示一个数字，没有 Token Plan？**
-A: 检查 `config.json` 里该供应商是否配置了 `tokenPacksApiUrl`。如果没有这个字段，只会显示现金余额。
+A: 检查 `config.json` 里该供应商是否配置了对应接口：LongCat 使用 `tokenPacksApiUrl`，MiMo 使用 `tokenPlanApiUrl`。还要确认计划任务或 `3-sync.bat` 最近成功同步过。
 
 **Q: 还需要本地代理吗？**
-A: 不需要。CC Switch 直接请求现金余额接口；LongCat Token Plan 由计划任务更新快照。
+A: 不需要。CC Switch 直接请求现金余额接口；MiMo 和 LongCat Token Plan 由计划任务更新快照。
 
-**Q: CC Switch 首页显示不全？**
-A: CC Switch 首页的显示格式是固定的 `remaining unit`，空间有限。当前格式为 `10 ¥ · 6484.7万`（余额 · Token Plan），已经是能显示完整信息的最短格式。
+**Q: 想在简略和完整显示之间切换？**
+A: 双击 `5-select-display-mode.bat` 并选择模式。简略模式把余额和 TP 放在同一行；完整模式分开展示余额与 Token Plan 剩余量、总量和已用量，LongCat 还会显示接口提供的到期信息。脚本会保存设置并立即同步。没有额度时保留 `Token Plan` 项，剩余显示为 0 tokens。
 
 ## 免责声明
 

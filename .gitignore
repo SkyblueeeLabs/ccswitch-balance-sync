@@ -1,5 +1,6 @@
 # 敏感文件 —— 绝对不要提交
 state.json
+display-mode.json
 cc-switch.backup-*.db
 *.db
 *.log
