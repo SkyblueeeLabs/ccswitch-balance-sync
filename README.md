@@ -116,10 +116,10 @@ Windows 计划任务（每 10 分钟短暂运行后退出）
 schtasks /Run /TN "CCSwitchBalanceSync"
 ```
 
-> 💡 计划任务通过隐藏 PowerShell 运行器启动 Node.js，**不打开控制台或浏览器**，同步结束即退出。
+> 💡 计划任务通过无控制台启动器运行同步，**不打开控制台或浏览器**，同步结束即退出。
 > 只有 Cookie 过期时才需要你手动双击 `2-login.bat`；如果已保存的登录态仍有效，它会自动获取并同步；否则完成登录后会自动同步。无人值守任务只会记录提示并退出。
 
-> 从旧版升级时，请重新运行一次 `4-setup-task.bat`（管理员身份）以替换旧的 6 小时任务。首次手动同步或重建任务时会清理旧版代理进程。
+> 修改任务启动方式后，请重新运行一次 `4-setup-task.bat`（管理员身份）以更新已登记的任务。首次手动同步或重建任务时会清理旧版代理进程。
 
 > ⚠️ **从旧版单独项目升级上来的话**：旧版各自创建过独立任务
 > （`MiMoCookieAutoRefresh` / `LongCatCookieAutoRefresh`），它们仍然每 6 小时运行、
@@ -192,7 +192,8 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 | `3-sync.bat` | 手动同步所有供应商状态和套餐快照 |
 | `4-setup-task.bat` | 创建自动刷新任务（需管理员权限） |
 | `setup-task.ps1` | 任务创建脚本 |
-| `run-auto-sync.ps1` | 隐藏运行计划任务并写日志 |
+| `run-auto-sync-hidden.vbs` | 无控制台启动自动同步 |
+| `run-auto-sync.ps1` | 运行计划任务并写日志 |
 | `stop-legacy-proxy.ps1` | 升级时清理旧版常驻代理 |
 | `playwright-login.mjs` | 登录脚本 |
 | `playwright-cookie.mjs` | 余额同步脚本 |

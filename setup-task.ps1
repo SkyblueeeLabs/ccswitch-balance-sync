@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 $taskName   = "CCSwitchBalanceSync"
 $scriptPath = Join-Path $PSScriptRoot "playwright-auto.mjs"
 $runnerPath = Join-Path $PSScriptRoot "run-auto-sync.ps1"
+$hiddenLauncherPath = Join-Path $PSScriptRoot "run-auto-sync-hidden.vbs"
 $cleanupPath = Join-Path $PSScriptRoot "stop-legacy-proxy.ps1"
 $logPath    = Join-Path $PSScriptRoot "auto-sync.log"
 $currentUser = "$env:USERDOMAIN\$env:USERNAME"
@@ -29,6 +30,11 @@ if (-not (Test-Path $scriptPath)) {
 }
 if (-not (Test-Path $runnerPath)) {
   Write-Host "[ERROR] 找不到隐藏运行器: $runnerPath" -ForegroundColor Red
+  Read-Host "按 Enter 退出"
+  exit 1
+}
+if (-not (Test-Path $hiddenLauncherPath)) {
+  Write-Host "[ERROR] 找不到无控制台启动器: $hiddenLauncherPath" -ForegroundColor Red
   Read-Host "按 Enter 退出"
   exit 1
 }
@@ -63,16 +69,19 @@ if (-not $nodeCmd) {
 Write-Host "  Node:       $nodeCmd" -ForegroundColor Gray
 Write-Host ""
 
-# 隐藏运行器短暂启动 Node，同步完成后进程退出，不常驻。
+# WSH 以隐藏窗口启动 PowerShell，再运行 Node 同步任务，不创建控制台窗口。
 $powerShellCmd = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$wscriptCmd = "$env:SystemRoot\System32\wscript.exe"
+$escapedWscript = [System.Security.SecurityElement]::Escape($wscriptCmd)
 $escapedPowerShell = [System.Security.SecurityElement]::Escape($powerShellCmd)
 $escapedNode   = [System.Security.SecurityElement]::Escape($nodeCmd)
 $escapedScript = [System.Security.SecurityElement]::Escape($scriptPath)
 $escapedRunner = [System.Security.SecurityElement]::Escape($runnerPath)
+$escapedLauncher = [System.Security.SecurityElement]::Escape($hiddenLauncherPath)
 $escapedLog    = [System.Security.SecurityElement]::Escape($logPath)
 $escapedPwd    = [System.Security.SecurityElement]::Escape($PSScriptRoot)
 $escapedUser   = [System.Security.SecurityElement]::Escape($currentUser)
-$arguments     = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$escapedRunner`" -NodePath `"$escapedNode`" -ScriptPath `"$escapedScript`" -LogPath `"$escapedLog`""
+$arguments     = "`"$escapedLauncher`" `"$escapedPowerShell`" `"$escapedRunner`" `"$escapedNode`" `"$escapedScript`" `"$escapedLog`""
 $startBoundary = (Get-Date).ToString("s")
 
 # 清理由旧版同步脚本留下的本项目代理进程。
@@ -113,7 +122,7 @@ $xml = @"
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>$escapedPowerShell</Command>
+      <Command>$escapedWscript</Command>
       <Arguments>$arguments</Arguments>
       <WorkingDirectory>$escapedPwd</WorkingDirectory>
     </Exec>
