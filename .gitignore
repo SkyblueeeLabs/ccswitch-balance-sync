@@ -1,8 +1,14 @@
 # 敏感文件 —— 绝对不要提交
 state.json
+state.json.*.tmp
 display-mode.json
+display-mode.json.*.tmp
 cc-switch.backup-*.db
 *.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.db.tmp
 *.log
 
 # 注意：config.json 里没有任何密钥（只有接口地址和字段路径），
@@ -10,6 +16,9 @@ cc-switch.backup-*.db
 
 # 依赖
 node_modules/
+
+# 工具的本地笔记
+.workbuddy/
 
 # 系统文件
 Thumbs.db

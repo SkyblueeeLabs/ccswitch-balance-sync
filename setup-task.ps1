@@ -1,5 +1,3 @@
-﻿# setup-task.ps1 - 创建 CC Switch 余额自动刷新任务
-# 需要管理员权限运行
 $ErrorActionPreference = 'Stop'
 
 $taskName   = "CCSwitchBalanceSync"
@@ -8,7 +6,8 @@ $runnerPath = Join-Path $PSScriptRoot "run-auto-sync.ps1"
 $hiddenLauncherPath = Join-Path $PSScriptRoot "run-auto-sync-hidden.vbs"
 $cleanupPath = Join-Path $PSScriptRoot "stop-legacy-proxy.ps1"
 $logPath    = Join-Path $PSScriptRoot "auto-sync.log"
-$currentUser = "$env:USERDOMAIN\$env:USERNAME"
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentUser = $identity.Name
 $refreshMinutes = 10
 
 Write-Host ""
@@ -23,35 +22,18 @@ Write-Host "  User:       $currentUser"
 Write-Host "  Frequency:  Every $refreshMinutes minutes"
 Write-Host ""
 
-if (-not (Test-Path $scriptPath)) {
-  Write-Host "[ERROR] 找不到脚本: $scriptPath" -ForegroundColor Red
-  Read-Host "按 Enter 退出"
-  exit 1
-}
-if (-not (Test-Path $runnerPath)) {
-  Write-Host "[ERROR] 找不到隐藏运行器: $runnerPath" -ForegroundColor Red
-  Read-Host "按 Enter 退出"
-  exit 1
-}
-if (-not (Test-Path $hiddenLauncherPath)) {
-  Write-Host "[ERROR] 找不到无控制台启动器: $hiddenLauncherPath" -ForegroundColor Red
-  Read-Host "按 Enter 退出"
-  exit 1
+foreach ($file in @($scriptPath, $runnerPath, $hiddenLauncherPath)) {
+  if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required file missing: $file" }
 }
 
-# 检查管理员权限
-$isAdmin = ([Security.Principal.WindowsPrincipal] `
-  [Security.Principal.WindowsIdentity]::GetCurrent()
-).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if (-not $isAdmin) {
-  Write-Host "[ERROR] 需要管理员权限，请右键以管理员身份运行 4-setup-task.bat" -ForegroundColor Red
-  Read-Host "按 Enter 退出"
-  exit 1
+if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
+  [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+  throw 'Right-click 4-setup-task.bat and select Run as administrator.'
 }
 
-# 定位 node.exe（计划任务不继承用户的 PATH，必须用绝对路径）
-$nodeCmd = (Get-Command node -ErrorAction SilentlyContinue).Source
+# Scheduled tasks use an absolute executable path.
+$nodeCmd = (Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $nodeCmd) {
   $candidates = @(
     "$env:ProgramFiles\nodejs\node.exe",
@@ -59,17 +41,15 @@ if (-not $nodeCmd) {
     "$env:LOCALAPPDATA\Programs\nodejs\node.exe",
     "$env:APPDATA\npm\node.exe"
   )
-  $nodeCmd = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+  $nodeCmd = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 }
-if (-not $nodeCmd) {
-  Write-Host "[ERROR] 找不到 node.exe，请先安装 Node.js" -ForegroundColor Red
-  Read-Host "按 Enter 退出"
-  exit 1
-}
+if (-not $nodeCmd) { throw 'Node.js was not found.' }
+& $nodeCmd --disable-warning=ExperimentalWarning -e "require('node:sqlite').DatabaseSync"
+if ($LASTEXITCODE -ne 0) { throw 'Node.js 22.13 or newer with node:sqlite is required.' }
 Write-Host "  Node:       $nodeCmd" -ForegroundColor Gray
 Write-Host ""
 
-# WSH 以隐藏窗口启动 PowerShell，再运行 Node 同步任务，不创建控制台窗口。
+# WSH starts the PowerShell runner without opening a console.
 $powerShellCmd = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $wscriptCmd = "$env:SystemRoot\System32\wscript.exe"
 $escapedWscript = [System.Security.SecurityElement]::Escape($wscriptCmd)
@@ -84,16 +64,11 @@ $escapedUser   = [System.Security.SecurityElement]::Escape($currentUser)
 $arguments     = "`"$escapedLauncher`" `"$escapedPowerShell`" `"$escapedRunner`" `"$escapedNode`" `"$escapedScript`" `"$escapedLog`""
 $startBoundary = (Get-Date).ToString("s")
 
-# 清理由旧版同步脚本留下的本项目代理进程。
-if (Test-Path $cleanupPath) {
-  & $powerShellCmd -NoProfile -ExecutionPolicy Bypass -File $cleanupPath
-}
-
 $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>CC Switch 余额静默同步（每 $refreshMinutes 分钟）</Description>
+    <Description>Sync CC Switch balances every $refreshMinutes minutes</Description>
   </RegistrationInfo>
   <Triggers>
     <TimeTrigger>
@@ -105,6 +80,13 @@ $xml = @"
       <Enabled>true</Enabled>
     </TimeTrigger>
   </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$escapedUser</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
@@ -127,35 +109,22 @@ $xml = @"
       <WorkingDirectory>$escapedPwd</WorkingDirectory>
     </Exec>
   </Actions>
-  <Principals>
-    <Principal id="Author">
-      <UserId>$escapedUser</UserId>
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
 </Task>
 "@
 
-Write-Host "创建任务..." -ForegroundColor Yellow
-schtasks /Delete /TN "$taskName" /F 2>$null | Out-Null
-
-$tmp = Join-Path $env:TEMP "ccswitch-task.xml"
-[System.IO.File]::WriteAllText($tmp, $xml, [System.Text.Encoding]::Unicode)
-
-schtasks /Create /TN "$taskName" /XML "$tmp" /F
-$ok = ($LASTEXITCODE -eq 0)
-Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-
-Write-Host ""
-if ($ok) {
-  Write-Host "[OK] 任务创建成功！" -ForegroundColor Green
-  Write-Host ""
-  Write-Host "  运行日志: $logPath" -ForegroundColor Gray
-  Write-Host "  立即测试: schtasks /Run /TN `"$taskName`"" -ForegroundColor Gray
-  Write-Host ""
-} else {
-  Write-Host "[ERROR] 任务创建失败。" -ForegroundColor Red
+Write-Host 'Registering task...' -ForegroundColor Yellow
+$tmp = Join-Path $env:TEMP "ccswitch-task-$([Guid]::NewGuid()).xml"
+try {
+  [System.IO.File]::WriteAllText($tmp, $xml, [System.Text.Encoding]::Unicode)
+  schtasks.exe /Create /TN $taskName /XML $tmp /F
+  if ($LASTEXITCODE -ne 0) { throw "Task Scheduler registration failed (exit $LASTEXITCODE)." }
+} finally {
+  [System.IO.File]::Delete($tmp)
 }
 
-Read-Host "按 Enter 退出"
+if (Test-Path -LiteralPath $cleanupPath -PathType Leaf) {
+  & $powerShellCmd -NoProfile -ExecutionPolicy Bypass -File $cleanupPath
+  if ($LASTEXITCODE -ne 0) { Write-Warning 'Could not stop the old balance proxy.' }
+}
+Write-Host "[OK] Task registered. Run now with: schtasks /Run /TN `"$taskName`"" -ForegroundColor Green
+exit 0

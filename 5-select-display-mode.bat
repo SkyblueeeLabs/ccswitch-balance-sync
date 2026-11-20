@@ -1,4 +1,5 @@
 @echo off
+setlocal
 cd /d "%~dp0"
 echo ==========================================
 echo   Balance Display Mode
@@ -25,7 +26,7 @@ goto sync
 :sync
 echo.
 echo Applying the selected mode to CC Switch...
-call "%~dp0\3-sync.bat"
+call "%~dp03-sync.bat"
 exit /b %ERRORLEVEL%
 
 :failed

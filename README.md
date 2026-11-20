@@ -58,11 +58,13 @@ Windows 计划任务（每 10 分钟短暂运行后退出）
 ```
 
 > CC Switch 的自定义脚本每次只发一个 HTTP 请求。现金余额由 CC Switch 直接查询；MiMo 和 LongCat 的 Token Plan 来自各自的接口，由短时计划任务更新快照。MiMo 显示剩余 tokens 数量，LongCat 显示套餐额度。项目不再启动常驻本地代理。
-> CC Switch 对当前使用中的供应商每 5 分钟自动查询一次；需要立即刷新时，可以点击卡片上的余额信息。Token Plan 快照由计划任务每 10 分钟更新。
+> 首次写入时，用量脚本默认每 5 分钟自动查询。已有的查询间隔会保留。点击卡片上的余额信息可立即刷新现金余额，Token Plan 快照由同步脚本更新。
 
 ### 核心特性
 
 - **多供应商支持**：一个项目管理多家供应商余额
+- **双端覆盖**：同一份用量脚本写入 Claude Code CLI 和 Claude Desktop 两个分组
+- **登录浏览器直连**：登录用的浏览器不走系统代理，开着全局代理也能秒开登录页，且不改动电脑的代理设置
 - **实时余额**：CC Switch 每次用量查询直接请求供应商余额接口
 - **自动维护**：隐藏计划任务每 10 分钟检查已保存的 Cookie 并更新 Token Plan 快照
 - **无需常驻进程**：每轮同步完成后 Node.js 进程退出，不启动本地代理、不重启 CC Switch
@@ -76,36 +78,24 @@ Windows 计划任务（每 10 分钟短暂运行后退出）
 | ✅ CC Switch 已安装 | 版本 3.0 以上 |
 | ✅ 供应商已配置 | 在 CC Switch 里添加供应商，填入有效的 API Key |
 | ✅ API 可正常调用 | 能用模型正常对话/推理 |
-| ✅ Node.js 已安装 | 版本 22.5 以上（使用内置 `node:sqlite`） |
+| ✅ Node.js 已安装 | 版本 22.13 以上（使用内置 `node:sqlite`） |
 | ✅ Windows 10/11 | 用于任务计划程序 |
 
 ## 安装
 
 ### 第一步：安装依赖
 
-双击运行 `1-install.bat`
+首次需要在浏览器里登录时，双击运行 `1-install.bat`，将锁定版本的 Playwright 安装到项目目录并准备 Chromium。升级后可以直接复用现有 `state.json` 和之前安装的 Playwright。
 
 ### 第二步：登录所有供应商
 
-双击运行 `2-login.bat`。它会自动检查所有供应商的已保存登录状态；如果仍有效，会自动保存并同步余额，无需操作。如果某家需要重新登录，在浏览器中完成登录后回到命令行按 **Enter**，脚本会自动保存状态并同步余额。
+双击运行 `2-login.bat`。有效的登录态可直接同步。需要重新登录的供应商会各自打开一个标签页，在浏览器完成登录后回到命令行按 **Enter**。余额接口验证通过后，脚本会保存对应供应商的登录状态并同步。
 
-### 第 2.5 步（首次必须）：设置自定义模板
-
-**打开 CC Switch → 供应商卡片 → 配置用量查询**
-
-对每个供应商：
-1. 启用"用量查询"开关
-2. 模板选择**"自定义"**
-3. 点击**"保存"**
-
-> ⚠️ **这一步只需要做一次**。如果不设置成"自定义"模板，脚本写入的代码会被 cc-switch 覆盖。
-> 官方模板、Token Plan 等内置模板都不支持自定义代码。
+同步时会自动启用 CC Switch 的自定义用量查询模板。如果要主动换账号，可在终端执行 `2-login.bat --force`。
 
 ### 第三步（可选）：手动重新同步
 
-双击运行 `3-sync.bat`
-
-双击运行 `3-sync.bat` 可随时重新校验登录态并更新 CC Switch 用量脚本。通常 `2-login.bat` 保存状态后会自动执行同步。现金余额由 CC Switch 直接实时查询；套餐快照在同步时更新，无需重启 CC Switch。
+双击运行 `3-sync.bat` 可随时校验登录态并更新 CC Switch 用量脚本。它和定时任务共用同步逻辑，直接请求接口。单家供应商出错时，其余供应商仍可更新。套餐接口出错时，会继续使用上次成功保存的快照。
 
 ### 第四步（可选）：设置自动刷新
 
@@ -119,7 +109,7 @@ Windows 计划任务（每 10 分钟短暂运行后退出）
 | 频率 | 每 10 分钟 |
 | 运行账户 | 当前登录用户（交互式，无需密码） |
 | 窗口 | 隐藏运行，无控制台窗口 |
-| 日志 | `auto-sync.log` |
+| 日志 | `auto-sync.log`，超过 512 KiB 后轮转到 `auto-sync.1.log` |
 
 创建后可以立即手动触发一次验证：
 
@@ -130,7 +120,7 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 > 💡 计划任务通过无控制台启动器运行同步，**不打开控制台或浏览器**，同步结束即退出。
 > 只有 Cookie 过期时才需要你手动双击 `2-login.bat`；如果已保存的登录态仍有效，它会自动获取并同步；否则完成登录后会自动同步。无人值守任务只会记录提示并退出。
 
-> 修改任务启动方式后，请重新运行一次 `4-setup-task.bat`（管理员身份）以更新已登记的任务。首次手动同步或重建任务时会清理旧版代理进程。
+> 修改任务启动方式后，可用管理员权限重新运行 `4-setup-task.bat` 更新已登记的任务。注册成功后会尝试清理指向本项目目录的旧版代理。
 
 > ⚠️ **从旧版单独项目升级上来的话**：旧版各自创建过独立任务
 > （`MiMoCookieAutoRefresh` / `LongCatCookieAutoRefresh`），它们仍然每 6 小时运行、
@@ -161,6 +151,8 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 | 重新登录 | 双击 `2-login.bat` | Cookie 过期时使用 |
 | 自动刷新 | 计划任务每 10 分钟 | 隐藏运行，完成后退出 |
 
+命令退出码为 `0` 时表示全部同步成功，`1` 表示存在失败，`2` 表示已有同步或登录在运行、本次跳过。
+
 ## 添加新供应商
 
 编辑 `config.json`，在 `providers` 数组中添加新条目：
@@ -169,29 +161,29 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 {
   "name": "供应商显示名称",
   "matchName": "供应商名称匹配关键词",
-  "loginUrl": "登录页面 URL",
-  "homeUrl": "首页 URL",
-  "apiUrl": "余额查询接口 URL",
+  "appTypes": ["claude", "claude-desktop"],
+  "loginUrl": "登录页面 HTTPS URL",
+  "apiUrl": "余额查询接口 HTTPS URL",
   "method": "GET 或 POST",
   "cookieDomain": "Cookie 域名",
-  "cookieNames": ["关键 Cookie 名称"],
   "balancePath": "余额字段路径，如 data.balance",
   "currencyPath": "币种字段路径，如 data.currency",
   "successCheck": "code",
-  "tokenPacksApiUrl": "LongCat 套餐接口 URL（可选）",
   "tokenPlanApiUrl": "MiMo Token Plan 接口 URL（可选）",
   "tokenPlanMethod": "Token Plan 接口方法，默认 GET",
   "tokenPlanItemNames": ["要统计的额度项名称"]
 }
 ```
 
+用量脚本默认写入 `claude`（Claude Code CLI）和 `claude-desktop`（Claude Desktop）两个分组，两边是同一份脚本和同一份 Cookie。可用 `appTypes`（数组）指定其他分组，旧写法 `appType`（单个分组名）也接受，也可以用 `providerId` 精确指定记录。分组内优先使用完整名称匹配，其次使用唯一包含该关键词的名称；某个分组里找不到对应记录时会跳过并在日志提示，不影响其他分组，也不影响退出码。余额和套餐接口须使用 HTTPS，且主机名属于 `cookieDomain`。如余额接口仅以 HTTP 状态表示成功，将 `successCheck` 设为 `null`。
+
+> **登录代理**：`config.json` 顶层的 `loginBrowserProxy` 控制登录时那个浏览器走不走代理。默认 `direct`，即直连、不使用系统代理，所以开着全局代理时登录页照样秒开，也不会改动电脑的代理设置。设为 `system` 可恢复跟随系统代理，用于登录页面本身需要代理的场景。余额与套餐接口的请求本来就是直连，不受此项影响。
+
 > **Token Plan 配置**：LongCat 使用 `tokenPacksApiUrl` 解析 Token Pack 剩余/总量；MiMo 使用 `tokenPlanApiUrl`、`tokenPlanItemNames` 解析额度项的 `limit - used`。MiMo 以 `¥ · X万` 紧凑显示。套餐快照最迟约 10 分钟刷新一次。MiMo 目前使用的是控制台会话 Cookie 可访问的接口，该接口未作为稳定公开 API 发布，供应商变更后可能需要调整字段或请求方式。MiMo 官方将 Token Plan 定位为编程工具套餐；本项目只读取控制台额度信息，不使用 Token Plan 凭证调用模型接口，仍请遵守[官方使用说明](https://mimo.mi.com/docs/zh-CN/tokenplan)。
 
 > **显示模式**：双击 `5-select-display-mode.bat`，选 1 让 MiMo 与 LongCat 都使用简略摘要，选 2 分开展示现金余额和 Token Plan。简略模式下无套餐时显示 `TP:无额度`；完整模式保留 `Token Plan` 全称，无额度时显示 0 tokens。选择会保存在本地 `display-mode.json` 并立即同步；之后的 10 分钟计划任务沿用该选择。切换模式无需重新运行 `4-setup-task.bat`。
 
-> ⚠️ **路径要写全**：`balancePath` 必须包含 `data.` 前缀（如 `data.paygoBalance.primary.amount`）。
-> CC Switch 传给 extractor 的是接口原始响应体，`data` 不会被自动解包。
-> 写成 `balance` 之类去掉 `data.` 的路径会导致 QuickJS 报「执行 extractor 失败」。
+> `balancePath` 和 `currencyPath` 从接口原始响应体的根节点开始。例如余额字段位于 `{"data":{"balance":0}}` 时，填写 `data.balance`。
 
 **如何获取这些参数：**
 1. 登录供应商控制台，打开余额页面
@@ -205,7 +197,7 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 |------|------|
 | `config.json` | 供应商配置（接口、字段映射） |
 | `display-mode.json` | 当前用量显示模式（选择器自动生成，本地保存） |
-| `1-install.bat` | 安装 Playwright 和 Chromium |
+| `1-install.bat` | 安装项目本地的 Playwright 和 Chromium |
 | `2-login.bat` | 复用有效登录态或重新登录，并自动同步余额 |
 | `3-sync.bat` | 手动同步所有供应商状态和套餐快照 |
 | `4-setup-task.bat` | 创建自动刷新任务（需管理员权限） |
@@ -218,9 +210,14 @@ schtasks /Run /TN "CCSwitchBalanceSync"
 | `playwright-login.mjs` | 登录脚本 |
 | `playwright-cookie.mjs` | 余额同步脚本 |
 | `playwright-auto.mjs` | 自动维护脚本（计划任务用） |
+| `lib/` | 共用的请求、用量脚本生成和数据库更新逻辑 |
 | `auto-sync.log` | 计划任务运行日志（自动生成） |
 | `state.json` | 浏览器登录状态（每台机器不同，不打包） |
-| `cc-switch.backup-*.db` | CC Switch 数据库备份（自动生成） |
+| `cc-switch.backup-*.db` | 更新前生成的 SQLite 快照，保存在原数据库旁，保留最近 20 份 |
+
+数据库默认位于用户目录下的 `.cc-switch/cc-switch.db`。如果 CC Switch 使用了自定义目录，可将环境变量 `CC_SWITCH_DB` 设为实际数据库的绝对路径。
+
+运行 `npm test` 可以使用模拟接口和临时数据库验证同步流程。
 
 ## 安全提示
 
@@ -258,16 +255,22 @@ git ls-files | findstr state    # 应无输出
 ## 常见问题
 
 **Q: 同步失败怎么办？**
-A: 运行 `2-login.bat`。它会检查现有登录态，需要时让你重新登录，并在保存后自动同步；也可以单独运行 `3-sync.bat` 重试。
+A: 查看窗口或 `auto-sync.log` 中各供应商的结果。显示「需要登录」时运行 `2-login.bat`。网络或接口短暂失败时可运行 `3-sync.bat` 重试。
 
 **Q: 余额不显示？**
 A: 确认供应商的用量查询已设置成"自定义"模板并保存。
+
+**Q: Claude Code 里能看到余额，Claude Desktop 里看不到？**
+A: 两个软件在 CC Switch 里属于不同的分组（`claude` / `claude-desktop`），各自存一份用量脚本。本项目默认两个分组都写，但前提是**两个分组里都添加过对应的供应商记录**。先在 CC Switch 的 Claude Desktop 分组里添加同名供应商，再运行 `3-sync.bat`。日志里出现「跳过 claude-desktop（无对应记录）」就说明该分组里还没有这条记录。
 
 **Q: 自动刷新不工作？**
 A: 检查任务是否存在：`schtasks /Query /TN "CCSwitchBalanceSync"`，并查看 `auto-sync.log` 了解每轮结果。手动触发测试：`schtasks /Run /TN "CCSwitchBalanceSync"`。
 
 **Q: 自动刷新时会不会弹浏览器窗口？**
 A: 不会。计划任务使用隐藏 PowerShell 运行器，常规同步不启动浏览器；任务进程完成后自动退出。Cookie 过期时只写日志，不会弹窗卡住。
+
+**Q: 开着全局代理时，重新登录的浏览器打开得很慢？**
+A: 登录用的浏览器默认**不走系统代理**，直连打开，所以不会因为全局代理变慢，也不会改动电脑的代理设置。如果某个供应商的登录页面本身需要代理，把 `config.json` 顶层的 `loginBrowserProxy` 设为 `system` 即可恢复跟随系统代理。注意：Clash / NordVPN 的 **TUN 模式**是在网络层接管流量，那种情况下浏览器层面绕不过去，和本项目无关。
 
 **Q: 余额显示的数字过一会儿又变回去了 / 修复的问题反复出现？**
 A: 大概率是有**旧的独立任务还在运行**，往同一个数据库写旧脚本。检查并删除旧任务：
@@ -286,8 +289,8 @@ A: 理论上支持所有有余额查询接口的供应商。只需在 `config.js
 **Q: 为什么需要管理员权限创建任务？**
 A: Windows 任务计划程序需要管理员权限才能创建任务。创建一次后，后续运行不需要。
 
-**Q: 提示「执行 extractor 失败: Exception generated by QuickJS」？**
-A: 说明写入 CC Switch 的脚本取值路径错了。关键点：**extractor 收到的 `response` 是接口原始响应体，`data` 不会被解包**，因此路径要写完整的 `data.balance`，不能简写成 `balance`。这类错误在 QuickJS 里表现为变量未定义的异常。重新运行一次 `3-sync.bat` 会覆盖修正。
+**Q: 卡片提示「余额字段缺失或格式无效」？**
+A: 检查 `config.json` 中的 `balancePath` 是否和供应商接口的原始响应一致。调整后运行 `3-sync.bat` 更新用量脚本。
 
 **Q: 余额只显示一个数字，没有 Token Plan？**
 A: 检查 `config.json` 里该供应商是否配置了对应接口：LongCat 使用 `tokenPacksApiUrl`，MiMo 使用 `tokenPlanApiUrl`。还要确认计划任务或 `3-sync.bat` 最近成功同步过。

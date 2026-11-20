@@ -1,0 +1,13 @@
+{
+  "name": "ccswitch-balance-sync",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright": "1.64.0"
+  }
+}

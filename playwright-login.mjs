@@ -1,143 +1,129 @@
-// playwright-login.mjs — 检查或更新所有供应商登录状态，并自动同步余额
-import { createRequire } from 'module';
-import { execSync, execFileSync } from 'child_process';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import { readFileSync, existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+import { inDomain, queryBalance } from './lib/providers.mjs';
+import { loadState, runExclusive, saveState, syncBalances } from './lib/sync.mjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const STATE_FILE = join(__dirname, 'state.json');
-const config = JSON.parse(readFileSync(join(__dirname, 'config.json'), 'utf8'));
-
-function isLoginRedirect(url) {
-  return /login|passport|signin|account\.xiaomi|sso/i.test(url);
-}
-
-async function probeProviderSession(page, p) {
+async function loadChromium() {
   try {
-    const result = await page.evaluate(async ({ apiUrl, method, balancePath }) => {
-      const response = await fetch(apiUrl, {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Client-Language': 'zh',
-          'X-Requested-With': 'XMLHttpRequest',
-        },
-        body: method === 'POST' ? '{}' : undefined,
-      });
-      const body = await response.json();
-      const balance = balancePath.split('.').reduce(
-        (value, key) => value == null ? undefined : value[key], body,
-      );
-      return { status: response.status, code: body.code, balance };
-    }, { apiUrl: p.apiUrl, method: p.method, balancePath: p.balancePath });
-
-    return result.status >= 200 && result.status < 300 && result.code === 0 && result.balance != null;
-  } catch {
-    return false;
-  }
-}
-
-async function loadPlaywright() {
-  // 1. 本地 node_modules
-  try {
-    return await import('playwright');
-  } catch {}
-
-  // 2. 常见全局安装路径（不依赖 execSync，兼容受限环境）
-  const appdata = process.env.APPDATA || join(homedir(), 'AppData', 'Roaming');
-  const candidates = [
-    join(appdata, 'npm', 'node_modules', 'playwright'),
-    join(homedir(), 'AppData', 'Local', 'npm', 'node_modules', 'playwright'),
-    process.env.NODE_PATH,
-    '/usr/local/lib/node_modules/playwright',
-    '/usr/lib/node_modules/playwright',
-  ];
-  for (const dir of candidates) {
-    if (!dir) continue;
+    return (await import('playwright')).chromium;
+  } catch (error) {
+    if (error.code !== 'ERR_MODULE_NOT_FOUND') throw error;
+    // Upgrades can keep using the npm global installation made by the old installer.
+    const appdata = process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming');
+    const require = createRequire(import.meta.url);
     try {
-      if (!existsSync(join(dir, 'package.json'))) continue;
-      const require = createRequire(join(dir, 'package.json'));
-      return require('playwright');
-    } catch {}
+      return require(join(appdata, 'npm', 'node_modules', 'playwright')).chromium;
+    } catch (fallbackError) {
+      if (fallbackError.code !== 'MODULE_NOT_FOUND') throw fallbackError;
+      throw new Error('找不到 Playwright，请运行 1-install.bat 安装。');
+    }
   }
+}
 
-  // 3. 最后尝试 npm root -g
+function mergeVerifiedState(previous, candidate, providers) {
+  const matches = host => typeof host === 'string' && providers.some(
+    provider => inDomain(host.toLowerCase().replace(/^\./, ''), provider.cookieDomain),
+  );
+  const hasOrigin = item => matches(URL.parse(item?.origin)?.hostname);
+  return {
+    ...previous,
+    cookies: [...previous.cookies.filter(item => !matches(item?.domain)), ...candidate.cookies.filter(item => matches(item.domain))],
+    origins: [...previous.origins.filter(item => !hasOrigin(item)), ...candidate.origins.filter(hasOrigin)],
+  };
+}
+
+function shareCookieDomain(left, right) {
+  return inDomain(left.cookieDomain, right.cookieDomain) || inDomain(right.cookieDomain, left.cookieDomain);
+}
+
+async function updateLogin(config, state, balances, pending) {
+  if (!process.stdin.isTTY) throw new Error('重新登录需要交互式终端，请双击 2-login.bat。');
+  const chromium = await loadChromium();
+  let browser;
   try {
-    const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
-    const require = createRequire(join(globalRoot, 'noop.js'));
-    return require('playwright');
-  } catch {}
-
-  throw new Error('找不到 Playwright，请运行: npm install -g playwright && npx playwright install chromium');
-}
-
-const { chromium } = await loadPlaywright();
-
-console.log('正在启动浏览器...\n');
-const browser = await chromium.launch({ headless: false });
-const context = await browser.newContext(
-  existsSync(STATE_FILE) ? { storageState: STATE_FILE } : undefined
-);
-
-const selected = config.providers.map((_, i) => i);
-
-// 为选中的供应商创建独立标签页，并先尝试复用 state.json 中仍有效的登录态。
-const pages = [];
-for (const i of selected) {
-  const p = config.providers[i];
-  console.log(`正在打开 ${p.name} 登录页面...`);
-  const pg = await context.newPage();
-  await pg.goto(p.homeUrl, { waitUntil: 'networkidle', timeout: 30000 }).catch(() => {});
-  pages.push(pg);
-  // 等待 SPA 初始化和 Cookie 设置
-  await new Promise(r => setTimeout(r, 5000));
-}
-
-const needsLogin = [];
-for (let n = 0; n < selected.length; n++) {
-  const p = config.providers[selected[n]];
-  const page = pages[n];
-  if (isLoginRedirect(page.url())) {
-    console.log(`  ${p.name}: ⚠ 登录状态失效，需要重新登录`);
-    needsLogin.push(p);
-    continue;
+    // Only this browser run goes direct, so a slow global proxy cannot hold up the
+    // login pages. The machine's proxy settings stay as they are. Note that Chromium
+    // ignores --no-proxy-server on Windows, so the direct route has to be explicit.
+    browser = await chromium.launch({
+      headless: false,
+      ...(config.loginBrowserProxy === 'system' ? {} : { args: ['--proxy-server=direct://'] }),
+    });
+  } catch (error) {
+    if (error.message.includes("Executable doesn't exist")) {
+      throw new Error('找不到 Chromium，请运行 1-install.bat 安装浏览器。');
+    }
+    throw new Error('Chromium 启动失败，请检查当前环境是否允许运行 Playwright 浏览器。');
   }
-  if (await probeProviderSession(page, p)) {
-    console.log(`  ${p.name}: ✓ 已登录，余额接口验证成功`);
-  } else {
-    console.log(`  ${p.name}: ⚠ 暂时无法通过余额接口验证，请检查页面登录状态`);
-    needsLogin.push(p);
+
+  try {
+    const context = await browser.newContext({ storageState: state }).catch(() => {
+      throw new Error('无法加载浏览器登录状态，请检查 state.json 的格式。');
+    });
+    await Promise.all(pending.map(async ({ provider }) => {
+      const page = await context.newPage();
+      console.log(`正在打开 ${provider.name} 的登录页面…`);
+      try {
+        await page.goto(provider.loginUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      } catch {
+        console.warn(`  ${provider.name}：页面加载未完成，可在浏览器中重试。`);
+      }
+    }));
+
+    console.log('\n登录完成后回到此窗口按 Enter。');
+    const input = createInterface({ input: process.stdin });
+    try {
+      const { done } = await input[Symbol.asyncIterator]().next();
+      if (done) throw new Error('登录已取消。');
+    } finally {
+      input.close();
+    }
+
+    const candidate = await context.storageState().catch(() => {
+      throw new Error('无法读取浏览器登录状态，请保持浏览器开启。');
+    });
+    const checks = await Promise.all(pending.map(async item => ({
+      ...item, balance: await queryBalance(item.provider, candidate),
+    })));
+    const failed = checks.filter(item => item.balance.error);
+    const verified = checks.filter(({ provider, balance }) =>
+      !balance.error && !failed.some(({ provider: other }) => shareCookieDomain(provider, other)));
+    if (verified.length) {
+      state = mergeVerifiedState(state, candidate, verified.map(({ provider }) => provider));
+      saveState(state);
+      console.log(`已保存验证通过的登录状态（${verified.map(({ provider }) => provider.name).join('、')}）。`);
+    }
+    for (const { provider, balance } of failed) {
+      console.warn(`  ${provider.name}：新登录验证失败（${balance.error}）。`);
+    }
+    const updated = await Promise.all(config.providers.map((provider, index) => {
+      const check = verified.find(item => item.index === index);
+      if (check) return check.balance;
+      if (verified.some(({ provider: other }) => shareCookieDomain(provider, other))) return queryBalance(provider, state);
+      return balances[index];
+    }));
+    return { state, balances: updated, incomplete: verified.length !== pending.length };
+  } finally {
+    await browser.close();
   }
 }
 
-if (needsLogin.length > 0) {
-  console.log('\n========================================');
-  console.log(' 请在浏览器中完成需要处理的供应商登录：');
-  for (const p of needsLogin) console.log(`   - ${p.name}`);
-  console.log('\n 登录完成后，回到这里按 Enter 键继续');
-  console.log('========================================\n');
-
-  const readline = await import('node:readline');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  await new Promise(resolve => rl.question('', resolve));
-  rl.close();
-}
-
-await context.storageState({ path: STATE_FILE });
-console.log(`✓ 登录状态已保存到: ${STATE_FILE}`);
-
-await browser.close();
-
-console.log('\n正在自动同步余额到 CC Switch...');
-try {
-  execFileSync(process.execPath, [join(__dirname, 'playwright-cookie.mjs')], {
-    cwd: __dirname,
-    stdio: 'inherit',
-    windowsHide: true,
-  });
-} catch (error) {
-  console.error('\n自动同步未完成；可以运行 3-sync.bat 重试。');
-  process.exitCode = error.status ?? 1;
-}
+await runExclusive(async config => {
+  let state = loadState(true);
+  let balances = await Promise.all(config.providers.map(provider => queryBalance(provider, state)));
+  const force = process.argv.includes('--force');
+  const pending = config.providers.map((provider, index) => ({ provider, index }))
+    .filter(({ index }) => force || balances[index].needsLogin);
+  let incomplete = false;
+  if (pending.length) {
+    try {
+      ({ state, balances, incomplete } = await updateLogin(config, state, balances, pending));
+    } catch (error) {
+      console.error(`登录未完成：${error.message}`);
+      incomplete = true;
+    }
+  }
+  const exitCode = await syncBalances(config, state, balances);
+  return incomplete ? 1 : exitCode;
+});
